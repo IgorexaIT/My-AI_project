@@ -56,6 +56,15 @@ async def init_db() -> None:
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS user_bus_trackers (
+                user_id INTEGER PRIMARY KEY,
+                route_number TEXT NOT NULL,
+                boarding_stop_name TEXT NOT NULL,
+                boarding_stop_id TEXT NOT NULL,
+                direction_stop_name TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+            );
             CREATE INDEX IF NOT EXISTS idx_telegram_identity_username
                 ON telegram_identities(username COLLATE NOCASE);
             CREATE TABLE IF NOT EXISTS expenses (
@@ -526,6 +535,51 @@ async def clear_weather_location(user_id: int) -> None:
     """Remove a saved weather location, returning the weather module to first-use state."""
     async with connect() as db:
         await db.execute("DELETE FROM user_weather_locations WHERE user_id=?", (user_id,))
+        await db.commit()
+
+
+async def get_bus_tracker(user_id: int) -> dict[str, Any] | None:
+    """Return the user's saved route and boarding-stop settings."""
+    async with connect() as db:
+        cur = await db.execute(
+            """SELECT route_number, boarding_stop_name, boarding_stop_id, direction_stop_name
+               FROM user_bus_trackers WHERE user_id=?""",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def set_bus_tracker(
+    user_id: int, route_number: str, boarding_stop_name: str,
+    boarding_stop_id: str, direction_stop_name: str,
+) -> None:
+    """Save a user's live bus tracker settings in SQLite."""
+    now = datetime.now(MOSCOW_TZ).isoformat(timespec="seconds")
+    async with connect() as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO users(user_id, monthly_budget, created_at) VALUES (?, 0, ?)",
+            (user_id, now),
+        )
+        await db.execute(
+            """INSERT INTO user_bus_trackers
+               (user_id, route_number, boarding_stop_name, boarding_stop_id, direction_stop_name, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   route_number=excluded.route_number,
+                   boarding_stop_name=excluded.boarding_stop_name,
+                   boarding_stop_id=excluded.boarding_stop_id,
+                   direction_stop_name=excluded.direction_stop_name,
+                   updated_at=excluded.updated_at""",
+            (user_id, route_number, boarding_stop_name, boarding_stop_id, direction_stop_name, now),
+        )
+        await db.commit()
+
+
+async def clear_bus_tracker(user_id: int) -> None:
+    """Remove a user's saved bus tracker settings."""
+    async with connect() as db:
+        await db.execute("DELETE FROM user_bus_trackers WHERE user_id=?", (user_id,))
         await db.commit()
 
 

@@ -131,8 +131,10 @@ def internship_links() -> InlineKeyboardMarkup:
 def local_menu(yandex_url: str) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.button(text="🌦 Погода по моему району", callback_data="local:weather")
-    b.button(text="🚌 С396 — ближайший рейс", callback_data="bus:now")
-    b.button(text="🕒 Рассчитать по времени выезда", callback_data="bus:custom")
+    b.button(text="🚌 Мой автобус — прогноз прибытия", callback_data="bus:now")
+    b.button(text="⚙️ Настроить/изменить автобус", callback_data="bus:setup")
+    b.button(text="🕒 С396 — расписание на сейчас", callback_data="bus:schedule")
+    b.button(text="🕓 С396 — выбрать время выезда", callback_data="bus:custom")
     b.button(text="🗺 Открыть движение в Яндекс Картах", url=yandex_url)
     b.button(text="🏠 Главное меню", callback_data="back:main")
     b.adjust(1)

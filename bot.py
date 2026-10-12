@@ -56,6 +56,7 @@ from keyboards import (
     stars_methods_menu,
 )
 from services import LocationNotFoundError, get_backend_news, get_weather, search_hh_vacancies
+from bus_tracker import BusTrackerError, get_stop_forecast, resolve_stop_uuid
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 logger = logging.getLogger("mai_lifeos")
@@ -96,6 +97,13 @@ class SessionForm(StatesGroup):
 
 class BusForm(StatesGroup):
     departure_time = State()
+
+
+class BusTrackerForm(StatesGroup):
+    route_number = State()
+    boarding_stop = State()
+    direction_stop = State()
+    boarding_stop_link = State()
 
 
 class HoursForm(StatesGroup):
@@ -349,7 +357,7 @@ async def show_module(callback: CallbackQuery, state: FSMContext, module: str) -
             "<b>🌦 Район и транспорт</b>\n\n"
             + weather_intro
             + "Для небольших районов, которые не находятся по одному названию, укажи ещё город. "
-            "Для автобуса С396 доступен расчёт по справочному расписанию и ссылка на Яндекс Карты для проверки фактического движения.",
+            "Можно настроить персональное отслеживание прибытия по данным табло Московского транспорта. Источник неофициальный и может быть недоступен; в таком случае бот сообщит об этом, а не выдаст расписание за GPS.",
             reply_markup=local_menu(BUS_SCHEDULE["yandex_live_url"]),
         )
     elif module == "backend":
@@ -1965,9 +1973,198 @@ async def send_bus_result(message: Message, target: datetime, custom: bool = Fal
     await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
 
 
+async def start_bus_tracker_setup(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await state.set_state(BusTrackerForm.route_number)
+    await message.answer(
+        "<b>🚌 Настройка отслеживания автобуса</b>\n\n"
+        "1/3. Введи номер маршрута, например <code>с396</code> или <code>733к</code>.\n\n"
+        "После этого укажешь остановку посадки и остановку, которая определяет нужное направление. Важно: ссылка на остановку должна вести именно на нужную платформу; название второй остановки сохраняется как подсказка направления.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+async def show_live_bus_tracker(message: Message, user_id: int) -> None:
+    settings = await db.get_bus_tracker(user_id)
+    if not settings:
+        # A message can be edited in callback flow, but the setup always needs a normal message.
+        await message.answer("Персональный маршрут ещё не настроен. Нажми «Настроить автобус».", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚌 Настроить автобус", callback_data="bus:setup")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:local")],
+        ]))
+        return
+
+    try:
+        result = await get_stop_forecast(settings["boarding_stop_id"], settings["route_number"])
+    except BusTrackerError as exc:
+        logger.warning("Live bus forecast unavailable for user_id=%s route=%s: %s", user_id, settings["route_number"], exc)
+        text = (
+            "<b>🚌 Не удалось получить актуальный прогноз</b>\n\n"
+            f"Маршрут: <b>{html.escape(settings['route_number'])}</b>\n"
+            f"Остановка: <b>{html.escape(settings['boarding_stop_name'])}</b>\n"
+            f"Подсказка направления: <b>{html.escape(settings['direction_stop_name'])}</b>\n\n"
+            f"{html.escape(str(exc))}\n\n"
+            "Время по телеметрии сейчас не подтверждено. Можно повторить запрос или открыть официальное табло/карту. "
+            "Справочное расписание в файле проекта содержит только маршрут с396 между Планерной и «Химико-технологическим университетом», "
+            "поэтому для произвольной остановки я не буду придумывать ETA."
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Повторить запрос", callback_data="bus:live")],
+            [InlineKeyboardButton(text="🗺 Открыть Московский транспорт", url="https://moscowtransport.app/")],
+            [InlineKeyboardButton(text="🕒 Открыть справочное расписание с396", callback_data="bus:schedule")],
+            [InlineKeyboardButton(text="✏️ Изменить маршрут/остановку", callback_data="bus:setup")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:local")],
+        ])
+        await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
+        return
+
+    lines = [
+        "<b>🚌 Прогноз прибытия</b>",
+        f"Маршрут: <b>{html.escape(settings['route_number'])}</b>",
+        f"Остановка: <b>{html.escape(result['stop_name'])}</b>",
+        f"Подсказка направления: <b>{html.escape(settings['direction_stop_name'])}</b>",
+        "",
+    ]
+    for forecast in result["forecasts"][:3]:
+        source_label = "телеметрия" if forecast["realtime"] else "расписание источника"
+        lines.append(
+            f"• <b>{forecast['arrival'].strftime('%H:%M')} МСК</b> — примерно через "
+            f"<b>{human_minutes(forecast['minutes'])}</b> ({source_label})"
+        )
+    if any(item["realtime"] for item in result["forecasts"][:3]):
+        lines.extend(["", "<i>Есть прогнозы, основанные на телеметрии. Это всё равно прогноз, а не гарантия точного времени.</i>"])
+    else:
+        lines.extend(["", "<i>Источник вернул расписание, но не подтвердил прибытие по телеметрии.</i>"])
+    lines.append("Источник: табло «Московского Транспорта» (неофициальное подключение к API).")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить прогноз", callback_data="bus:live")],
+        [InlineKeyboardButton(text="✏️ Изменить маршрут/остановку", callback_data="bus:setup")],
+        [InlineKeyboardButton(text="🗺 Открыть Московский транспорт", url="https://moscowtransport.app/")],
+        [InlineKeyboardButton(text="🗑 Удалить сохранённый маршрут", callback_data="bus:clear")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:local")],
+    ])
+    await message.answer("\n".join(lines), reply_markup=kb, disable_web_page_preview=True)
+
+
 @dp.callback_query(F.data == "bus:now")
-async def bus_now(callback: CallbackQuery) -> None:
-    await callback.answer("Рассчитываю ближайший рейс…")
+async def bus_now(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if not callback.message:
+        return
+    settings = await db.get_bus_tracker(callback.from_user.id)
+    if not settings:
+        await start_bus_tracker_setup(callback.message, state)
+        return
+    await show_live_bus_tracker(callback.message, callback.from_user.id)
+
+
+@dp.callback_query(F.data.in_({"bus:setup", "bus:edit"}))
+async def bus_tracker_setup_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if callback.message:
+        await start_bus_tracker_setup(callback.message, state)
+
+
+@dp.message(BusTrackerForm.route_number)
+async def bus_tracker_route(message: Message, state: FSMContext) -> None:
+    route = " ".join((message.text or "").split()).strip()
+    if not route or len(route) > 20 or not re.fullmatch(r"[0-9A-Za-zА-Яа-яЁё№ -]+", route):
+        await message.answer("Введи номер маршрута без лишнего текста, например <code>с396</code>.")
+        return
+    await state.update_data(route_number=route)
+    await state.set_state(BusTrackerForm.boarding_stop)
+    await message.answer(
+        "2/3. Введи название остановки, где садишься. Если знаешь ссылку на эту остановку в приложении «Московский транспорт», можешь отправить её сразу.\n\n"
+        "Если отправишь только название, на следующем шаге бот попросит ссылку, чтобы однозначно определить остановочную платформу.",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@dp.message(BusTrackerForm.boarding_stop)
+async def bus_tracker_boarding_stop(message: Message, state: FSMContext) -> None:
+    value = (message.text or "").strip()
+    if len(value) < 2 or len(value) > 300:
+        await message.answer("Введи название остановки или ссылку из приложения «Московский транспорт».")
+        return
+    stop_id = await resolve_stop_uuid(value)
+    stop_name = value if not value.startswith(("http://", "https://")) else "Остановка по ссылке"
+    await state.update_data(boarding_stop_name=stop_name, boarding_stop_id=stop_id or "")
+    await state.set_state(BusTrackerForm.direction_stop)
+    await message.answer(
+        "3/3. Введи название остановки, по которой можно определить нужное направление (например, конечную или промежуточную остановку в сторону поездки).",
+        reply_markup=cancel_keyboard(),
+    )
+
+
+@dp.message(BusTrackerForm.direction_stop)
+async def bus_tracker_direction_stop(message: Message, state: FSMContext) -> None:
+    direction_stop = " ".join((message.text or "").split()).strip()
+    if len(direction_stop) < 2 or len(direction_stop) > 200:
+        await message.answer("Введи название остановки направления, не короче двух символов.")
+        return
+    await state.update_data(direction_stop_name=direction_stop)
+    data = await state.get_data()
+    if not data.get("boarding_stop_id"):
+        await state.set_state(BusTrackerForm.boarding_stop_link)
+        await message.answer(
+            "Чтобы получать прогноз, нужно однозначно определить остановку: одного названия недостаточно, потому что рядом могут быть платформы в разных направлениях.\n\n"
+            "Открой остановку в приложении «Московский транспорт», нажми «Поделиться» и отправь сюда ссылку. Подойдут короткая ссылка вида <code>https://moscowapp.mos.ru/l/...</code> или ссылка с UUID.",
+            reply_markup=cancel_keyboard(),
+        )
+        return
+    await db.set_bus_tracker(
+        message.from_user.id, data["route_number"], data["boarding_stop_name"],
+        data["boarding_stop_id"], data["direction_stop_name"],
+    )
+    await state.clear()
+    await message.answer("✅ Маршрут сохранён. Проверяю ближайший прогноз…")
+    await show_live_bus_tracker(message, message.from_user.id)
+
+
+@dp.message(BusTrackerForm.boarding_stop_link)
+async def bus_tracker_stop_link(message: Message, state: FSMContext) -> None:
+    link = (message.text or "").strip()
+    stop_id = await resolve_stop_uuid(link)
+    if not stop_id:
+        await message.answer(
+            "Не получилось извлечь ID остановки из этой ссылки. Отправь ссылку «Поделиться» из приложения «Московский транспорт» ещё раз; не отправляй ссылку на главную страницу.",
+            reply_markup=cancel_keyboard(),
+        )
+        return
+    data = await state.get_data()
+    await db.set_bus_tracker(
+        message.from_user.id, data["route_number"], data["boarding_stop_name"],
+        stop_id, data["direction_stop_name"],
+    )
+    await state.clear()
+    await message.answer("✅ Остановка распознана, настройки сохранены. Проверяю ближайший прогноз…")
+    await show_live_bus_tracker(message, message.from_user.id)
+
+
+@dp.callback_query(F.data == "bus:live")
+async def bus_live_refresh(callback: CallbackQuery) -> None:
+    await callback.answer("Обновляю прогноз…")
+    if callback.message:
+        await show_live_bus_tracker(callback.message, callback.from_user.id)
+
+
+@dp.callback_query(F.data == "bus:clear")
+async def bus_tracker_clear(callback: CallbackQuery) -> None:
+    await db.clear_bus_tracker(callback.from_user.id)
+    await callback.answer("Маршрут удалён")
+    if callback.message:
+        await callback.message.answer(
+            "🗑 Персональный маршрут удалён. Чтобы настроить его снова, нажми кнопку ниже.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🚌 Настроить автобус", callback_data="bus:setup")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="back:local")],
+            ]),
+        )
+
+
+@dp.callback_query(F.data == "bus:schedule")
+async def bus_schedule_now(callback: CallbackQuery) -> None:
+    await callback.answer("Считаю по справочному расписанию…")
     if callback.message:
         await send_bus_result(callback.message, moscow_now(), custom=False)
 
